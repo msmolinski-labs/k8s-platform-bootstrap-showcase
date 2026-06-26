@@ -1,0 +1,137 @@
+---
+
+- name: "[ARGOCD] Install ArgoCD"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "[PRE-CHECK] Check if helm is installed"
+      command: which helm
+      register: helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[GUARD] Fail if helm not found"
+      fail:
+        msg: |
+          helm not found in PATH.
+
+          Install helm on WSL2:
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      when: helm_check.rc != 0
+
+    - name: "[PRE-CHECK] Check if ArgoCD release already exists"
+      command: helm status argocd -n {{ argocd_namespace }}
+      register: argocd_release_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[INFO] ArgoCD already installed – skipping"
+      debug:
+        msg: "ArgoCD release already exists in namespace {{ argocd_namespace }}. Skipping."
+      when: argocd_release_check.rc == 0
+
+    - name: "[INSTALL] Install ArgoCD"
+      block:
+
+        - name: "[INSTALL] Add ArgoCD Helm repository"
+          command: helm repo add argo https://argoproj.github.io/argo-helm
+          changed_when: false
+
+        - name: "[INSTALL] Update Helm repositories"
+          command: helm repo update
+          changed_when: false
+
+        - name: "[INSTALL] Create argocd namespace"
+          command: kubectl create namespace {{ argocd_namespace }}
+          register: ns_create
+          failed_when: ns_create.rc != 0 and 'already exists' not in ns_create.stderr
+
+        - name: "[INSTALL] Install ArgoCD via Helm"
+          command: >
+            helm install argocd argo/argo-cd
+            --namespace {{ argocd_namespace }}
+            --version {{ argocd_chart_version }}
+            --set server.service.type=ClusterIP
+            --wait
+            --timeout 5m
+          register: argocd_install
+
+        - name: "[INSTALL] Print install output"
+          debug:
+            msg: "{{ argocd_install.stdout_lines }}"
+
+        - name: "[OK] ArgoCD installed"
+          debug:
+            msg: |
+              ArgoCD {{ argocd_chart_version }} installed in namespace {{ argocd_namespace }}.
+
+              Ingress will be created by ArgoCD via infrastructure-app
+              (kubernetes/infrastructure/argocd-ingress.yaml).
+
+              After infrastructure-app syncs:
+                https://argocd.{{ base_domain }}
+
+              Get admin password:
+                kubectl -n {{ argocd_namespace }} get secret argocd-initial-admin-secret \
+                  -o jsonpath="{.data.password}" | base64 -d && echo
+
+              Temporary access via port-forward:
+                kubectl port-forward svc/argocd-server -n {{ argocd_namespace }} 8080:443
+                https://localhost:8080
+
+      rescue:
+        - name: "[ERROR] ArgoCD installation failed"
+          debug:
+            msg: |
+              ArgoCD installation failed.
+
+              Troubleshooting:
+                1. Are nodes Ready?         →  kubectl get nodes
+                2. Are pods starting?       →  kubectl get pods -n {{ argocd_namespace }}
+                3. Pod logs:                →  kubectl logs -n {{ argocd_namespace }} <pod-name>
+                4. Cluster events:          →  kubectl get events -n {{ argocd_namespace }} --sort-by='.lastTimestamp'
+
+              To reinstall:
+                helm uninstall argocd -n {{ argocd_namespace }}
+                kubectl delete namespace {{ argocd_namespace }}
+                Run the playbook again.
+
+        - name: "[FAIL] Stop after ArgoCD installation failure"
+          fail:
+            msg: "ArgoCD installation failed. Check the logs above."
+
+      when: argocd_release_check.rc != 0
+
+    - name: "[WAIT] Wait for ArgoCD server to be ready"
+      command: kubectl wait --for=condition=available deployment/argocd-server -n {{ argocd_namespace }} --timeout=120s
+      changed_when: false
+
+    - name: "[REPO] Register private GitHub repo (Kubernetes Secret)"
+      shell: |
+        kubectl apply -f - <<'EOF'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: github-repo-creds
+          namespace: {{ argocd_namespace }}
+          labels:
+            argocd.argoproj.io/secret-type: repository
+        stringData:
+          type: git
+          url: https://github.com/{{ github_org }}/{{ github_repo }}.git
+          username: {{ github_org }}
+          password: {{ github_token }}
+        EOF
+      no_log: true
+      when: github_token | length > 0
+
+    - name: "[WARN] No GitHub token – ArgoCD cannot sync private repo"
+      debug:
+        msg: |
+          github_token is empty.
+          ArgoCD will NOT be able to sync from the private repo.
+          Add token to secrets.sops.yaml and re-run the argocd phase with decrypted extra-vars.
+      when: github_token | length == 0

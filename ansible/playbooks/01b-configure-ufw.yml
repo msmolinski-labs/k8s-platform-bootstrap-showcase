@@ -1,0 +1,169 @@
+---
+
+- name: "[UFW] Configure UFW for control-plane"
+  hosts: control_plane
+  become: true
+
+  tasks:
+    - name: "[UFW] Reset UFW to defaults"
+      ufw:
+        state: reset
+
+    - name: "[UFW] Allow SSH"
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: "[UFW] Allow Kubernetes API server"
+      ufw:
+        rule: allow
+        port: "6443"
+        proto: tcp
+
+    - name: "[UFW] Allow etcd"
+      ufw:
+        rule: allow
+        port: "2379:2380"
+        proto: tcp
+
+    - name: "[UFW] Allow etcd metrics"
+      ufw:
+        rule: allow
+        port: "2381"
+        proto: tcp
+
+    - name: "[UFW] Allow kubelet"
+      ufw:
+        rule: allow
+        port: "10250"
+        proto: tcp
+
+    - name: "[UFW] Allow kube-scheduler"
+      ufw:
+        rule: allow
+        port: "10259"
+        proto: tcp
+
+    - name: "[UFW] Allow kube-controller-manager"
+      ufw:
+        rule: allow
+        port: "10257"
+        proto: tcp
+
+    - name: "[UFW] Allow kube-proxy metrics"
+      ufw:
+        rule: allow
+        port: "10249"
+        proto: tcp
+
+    - name: "[UFW] Allow Cilium VXLAN"
+      ufw:
+        rule: allow
+        port: "8472"
+        proto: udp
+
+    - name: "[UFW] Allow Cilium health check"
+      ufw:
+        rule: allow
+        port: "4240"
+        proto: tcp
+
+    - name: "[UFW] Allow node-exporter metrics"
+      ufw:
+        rule: allow
+        port: "9100"
+        proto: tcp
+
+    - name: "[UFW] Allow internal cluster traffic"
+      ufw:
+        rule: allow
+        src: "10.0.0.0/8"
+
+    - name: "[UFW] Set default outgoing policy to allow"
+      ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: "[UFW] Enable UFW"
+      ufw:
+        state: enabled
+        policy: deny
+
+    - name: "[UFW] Verify outgoing internet works after UFW enable"
+      shell: curl -fsSL --max-time 10 --retry 3 https://example.com -o /dev/null
+      changed_when: false
+
+- name: "[UFW] Configure UFW for workers"
+  hosts: workers
+  become: true
+
+  tasks:
+    - name: "[UFW] Reset UFW to defaults"
+      ufw:
+        state: reset
+
+    - name: "[UFW] Allow SSH"
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: "[UFW] Allow kubelet"
+      ufw:
+        rule: allow
+        port: "10250"
+        proto: tcp
+
+    - name: "[UFW] Allow kube-proxy metrics"
+      ufw:
+        rule: allow
+        port: "10249"
+        proto: tcp
+
+    - name: "[UFW] Allow NodePort HTTP from load balancer"
+      ufw:
+        rule: allow
+        port: "{{ nginx_upstream_port }}"
+        proto: tcp
+        src: "{{ lb_ip }}"
+
+    - name: "[UFW] Allow NodePort HTTPS from load balancer"
+      ufw:
+        rule: allow
+        port: "{{ nginx_upstream_port_ssl }}"
+        proto: tcp
+        src: "{{ lb_ip }}"
+
+    - name: "[UFW] Allow Cilium VXLAN"
+      ufw:
+        rule: allow
+        port: "8472"
+        proto: udp
+
+    - name: "[UFW] Allow Cilium health check"
+      ufw:
+        rule: allow
+        port: "4240"
+        proto: tcp
+
+    - name: "[UFW] Allow node-exporter metrics"
+      ufw:
+        rule: allow
+        port: "9100"
+        proto: tcp
+
+    - name: "[UFW] Allow internal cluster traffic"
+      ufw:
+        rule: allow
+        src: "10.0.0.0/8"
+
+    - name: "[UFW] Set default outgoing policy to allow"
+      ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: "[UFW] Enable UFW"
+      ufw:
+        state: enabled
+        policy: deny

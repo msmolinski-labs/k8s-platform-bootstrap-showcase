@@ -1,0 +1,41 @@
+---
+- name: "[K8S] Install Kubernetes components"
+  hosts: control_plane:workers
+  become: true
+
+  tasks:
+
+    - name: "[REPO] Add Kubernetes GPG key"
+      shell: |
+        curl -fsSL --max-time 30 --retry 5 --retry-delay 10 https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes.gpg
+      changed_when: true
+
+    - name: "[REPO] Add Kubernetes repository"
+      shell: |
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+
+    - name: "[INSTALL] Install kubeadm, kubelet, kubectl"
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: "[INSTALL] Hold Kubernetes packages at current version"
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: "[SERVICE] Enable kubelet"
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started

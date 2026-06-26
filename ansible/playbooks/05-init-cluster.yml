@@ -1,0 +1,165 @@
+---
+- name: "[INIT] Initialize Kubernetes cluster (kubeadm init)"
+  hosts: control_plane
+  become: true
+
+  tasks:
+
+    - name: "[PRE-CHECK] Check if cluster is already initialized"
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeconfig_exists
+
+    - name: "[INFO] Cluster already initialized – skipping kubeadm init"
+      debug:
+        msg: "File /etc/kubernetes/admin.conf exists. Skipping kubeadm init (idempotent)."
+      when: kubeconfig_exists.stat.exists
+
+    - name: "[INIT] Initialize Kubernetes cluster"
+      block:
+
+        - name: "[INIT] Run kubeadm init"
+          command: >
+            kubeadm init
+            --pod-network-cidr={{ pod_network_cidr }}
+            --service-cidr={{ service_cidr }}
+            --apiserver-advertise-address={{ ansible_host }}
+          register: kubeadm_output
+
+        - name: "[INIT] Print kubeadm init output"
+          debug:
+            msg: "{{ kubeadm_output.stdout_lines }}"
+
+        - name: "[INIT] Create .kube directory for root"
+          file:
+            path: /root/.kube
+            state: directory
+            mode: '0700'
+
+        - name: "[INIT] Copy kubeconfig for root"
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            remote_src: yes
+            mode: '0600'
+
+      rescue:
+        - name: "[ERROR] kubeadm init failed"
+          debug:
+            msg: |
+              kubeadm init failed.
+
+              Troubleshooting:
+                1. Is containerd running?   →  systemctl status containerd
+                2. Is port 6443 available?  →  ss -tlnp | grep 6443
+                3. kubelet logs:            →  journalctl -xeu kubelet --no-pager | tail -30
+
+              To retry, reset first:
+                kubeadm reset -f && rm -rf /etc/cni/net.d
+
+              Then run the playbook again.
+
+        - name: "[FAIL] Stop after kubeadm init failure"
+          fail:
+            msg: "kubeadm init failed. Check the logs above."
+
+      when: not kubeconfig_exists.stat.exists
+
+    - name: "[KUBECONFIG] Fetch kubeconfig from control-plane to temp file"
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "~/.kube/config-{{ env_name }}-raw"
+        flat: yes
+
+    - name: "[KUBECONFIG] Merge into local kubeconfig (preserves other contexts)"
+      delegate_to: localhost
+      become: false
+      shell: |
+        set -euo pipefail
+        ENV_NAME="{{ env_name }}"
+        TEMP_RAW=~/.kube/config-${ENV_NAME}-raw
+        TEMP_NAMED=~/.kube/config-${ENV_NAME}-named
+
+        mkdir -p ~/.kube
+
+        YQ_BIN=$(command -v yq 2>/dev/null || echo ~/yq)
+        $YQ_BIN e "
+          .clusters[0].name = \"${ENV_NAME}\" |
+          .contexts[0].name = \"${ENV_NAME}\" |
+          .contexts[0].context.cluster = \"${ENV_NAME}\" |
+          .contexts[0].context.user = \"${ENV_NAME}-admin\" |
+          .users[0].name = \"${ENV_NAME}-admin\" |
+          .current-context = \"${ENV_NAME}\"
+        " "${TEMP_RAW}" > "${TEMP_NAMED}"
+
+        if [[ -f ~/.kube/config ]]; then
+          cp ~/.kube/config ~/.kube/config.bak
+          for ctx in "${ENV_NAME}" "kubernetes-admin@kubernetes"; do
+            KUBECONFIG=~/.kube/config kubectl config delete-context "$ctx" 2>/dev/null || true
+          done
+          for cl in "${ENV_NAME}" "kubernetes"; do
+            KUBECONFIG=~/.kube/config kubectl config delete-cluster "$cl" 2>/dev/null || true
+          done
+          for usr in "${ENV_NAME}-admin" "kubernetes-admin"; do
+            KUBECONFIG=~/.kube/config kubectl config delete-user "$usr" 2>/dev/null || true
+          done
+          KUBECONFIG=~/.kube/config:${TEMP_NAMED} \
+            kubectl config view --flatten > ~/.kube/config.merged
+          mv ~/.kube/config.merged ~/.kube/config
+        else
+          cp "${TEMP_NAMED}" ~/.kube/config
+        fi
+
+        chmod 600 ~/.kube/config
+        rm -f "${TEMP_RAW}" "${TEMP_NAMED}"
+        kubectl config use-context "${ENV_NAME}"
+      args:
+        executable: /bin/bash
+      register: kubeconfig_merge
+
+    - name: "[INFO] Kubeconfig merged"
+      debug:
+        msg: "Kubeconfig merged – context: {{ env_name }}. Other environment contexts preserved."
+
+    - name: "[METRICS] Fix kube-scheduler metrics bind address"
+      replace:
+        path: /etc/kubernetes/manifests/kube-scheduler.yaml
+        regexp: '--bind-address=127.0.0.1'
+        replace: '--bind-address=0.0.0.0'
+
+    - name: "[METRICS] Fix kube-controller-manager metrics bind address"
+      replace:
+        path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+        regexp: '--bind-address=127.0.0.1'
+        replace: '--bind-address=0.0.0.0'
+
+    - name: "[METRICS] Fix etcd metrics listen address"
+      replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '--listen-metrics-urls=http://127.0.0.1:2381'
+        replace: '--listen-metrics-urls=http://0.0.0.0:2381'
+
+    - name: "[INFO] Control plane metrics endpoints fixed"
+      debug:
+        msg: "Control plane manifest files updated. kubelet will restart affected pods automatically."
+
+    - name: "[WAIT] Wait for Kubernetes API readyz after control-plane manifest updates"
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz
+      register: api_readyz
+      changed_when: false
+      retries: 24
+      delay: 5
+      until: api_readyz.stdout is search('ok')
+
+    - name: "[JOIN] Generate worker join command on control-plane"
+      command: kubeadm token create --print-join-command
+      register: kubeadm_join_command
+      changed_when: true
+
+    - name: "[JOIN] Save worker join command on control-plane"
+      copy:
+        content: "{{ kubeadm_join_command.stdout | trim }}\n"
+        dest: /tmp/kubeadm_join_command
+        owner: root
+        group: root
+        mode: '0600'

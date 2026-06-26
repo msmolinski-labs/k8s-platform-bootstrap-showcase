@@ -1,0 +1,78 @@
+---
+
+- name: "[CILIUM] Install Cilium CNI"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "[PRE-CHECK] Check if cilium CLI is installed"
+      command: which cilium
+      register: cilium_cli_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[GUARD] Fail if cilium CLI not found"
+      fail:
+        msg: |
+          cilium CLI not found in PATH.
+
+          Install cilium CLI on WSL2:
+            CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+            curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz
+            tar -xvzf cilium-linux-amd64.tar.gz
+            sudo mv cilium /usr/local/bin/
+      when: cilium_cli_check.rc != 0
+
+    - name: "[PRE-CHECK] Check if Cilium is already installed"
+      command: cilium status --brief
+      register: cilium_status
+      changed_when: false
+      failed_when: false
+
+    - name: "[INFO] Cilium already installed – skipping"
+      debug:
+        msg: "Cilium is already installed in the cluster. Skipping."
+      when: cilium_status.rc == 0
+
+    - name: "[INSTALL] Install Cilium"
+      block:
+
+        - name: "[INSTALL] Install Cilium"
+          command: "cilium install --version {{ cilium_version }}"
+          register: cilium_install
+
+        - name: "[INSTALL] Print install output"
+          debug:
+            msg: "{{ cilium_install.stdout_lines }}"
+
+        - name: "[WAIT] Wait for Cilium to become ready"
+          command: cilium status --wait
+          register: cilium_wait
+          timeout: 180
+
+        - name: "[OK] Cilium installed and ready"
+          debug:
+            msg: "Cilium {{ cilium_version }} is running. Nodes should transition to Ready state."
+
+      rescue:
+        - name: "[ERROR] Cilium installation failed"
+          debug:
+            msg: |
+              Cilium installation failed.
+
+              Troubleshooting:
+                1. Is kubeconfig valid?     →  kubectl get nodes
+                2. Cilium pod logs:         →  kubectl logs -n kube-system -l k8s-app=cilium --tail=50
+                3. Cluster events:          →  kubectl get events -n kube-system --sort-by='.lastTimestamp'
+
+              To reinstall:
+                cilium uninstall
+                Run the playbook again.
+
+        - name: "[FAIL] Stop after Cilium installation failure"
+          fail:
+            msg: "Cilium installation failed. Check the logs above."
+
+      when: cilium_status.rc != 0

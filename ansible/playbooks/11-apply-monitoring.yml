@@ -1,0 +1,158 @@
+---
+
+- name: "[GITOPS] Bootstrap infrastructure and monitoring"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "[STEP] Generate per-environment bootstrap manifests"
+      block:
+
+        - name: "[STEP] Set git branch per environment"
+          set_fact:
+            git_branch: "{{ 'main' if env_name == 'prod' else env_name }}"
+
+        - name: "[STEP] Ensure local bootstrap manifest temp directory exists"
+          file:
+            path: "{{ bootstrap_manifests_path }}"
+            state: directory
+            mode: '0700'
+
+        - name: "[STEP] Generate infrastructure-app.yaml for {{ env_name }}"
+          copy:
+            dest: "{{ bootstrap_manifests_path }}/infrastructure-app.yaml"
+            content: |
+              apiVersion: argoproj.io/v1alpha1
+              kind: Application
+              metadata:
+                name: infrastructure
+                namespace: argocd
+              spec:
+                project: default
+                source:
+                  repoURL: https://github.com/{{ github_org }}/{{ github_repo }}.git
+                  targetRevision: {{ git_branch }}
+                  path: kubernetes/infrastructure/overlays/{{ env_name }}
+                destination:
+                  server: https://kubernetes.default.svc
+                  namespace: argocd
+                syncPolicy:
+                  automated:
+                    prune: true
+                    selfHeal: true
+                  syncOptions:
+                    - CreateNamespace=true
+
+        - name: "[STEP] Generate monitoring-app.yaml for {{ env_name }}"
+          copy:
+            dest: "{{ bootstrap_manifests_path }}/monitoring-app.yaml"
+            content: |
+              apiVersion: argoproj.io/v1alpha1
+              kind: Application
+              metadata:
+                name: monitoring
+                namespace: argocd
+              spec:
+                project: default
+                source:
+                  repoURL: https://github.com/{{ github_org }}/{{ github_repo }}.git
+                  targetRevision: {{ git_branch }}
+                  path: kubernetes/apps/monitoring/overlays/{{ env_name }}
+                destination:
+                  server: https://kubernetes.default.svc
+                  namespace: monitoring
+                syncPolicy:
+                  automated:
+                    prune: true
+                    selfHeal: true
+                  syncOptions:
+                    - CreateNamespace=true
+
+        - name: "[OK] Bootstrap manifests generated for {{ env_name }} (branch: {{ git_branch }})"
+          debug:
+            msg: "system-app, infrastructure-app, monitoring-app → {{ env_name }} / {{ git_branch }} / {{ bootstrap_manifests_path }}"
+
+    - name: "[STEP] Apply infrastructure-app.yaml and monitoring-app.yaml"
+      block:
+
+        - name: "[STEP] Apply infrastructure-app.yaml"
+          command: kubectl apply -f {{ bootstrap_manifests_path }}/infrastructure-app.yaml
+          register: infra_apply
+
+        - name: "[STEP] Print infrastructure-app apply result"
+          debug:
+            msg: "{{ infra_apply.stdout_lines }}"
+
+        - name: "[STEP] Apply monitoring-app.yaml"
+          command: kubectl apply -f {{ bootstrap_manifests_path }}/monitoring-app.yaml
+          register: monitoring_apply
+
+        - name: "[STEP] Print monitoring-app apply result"
+          debug:
+            msg: "{{ monitoring_apply.stdout_lines }}"
+
+        - name: "[WAIT] Wait for system applications to reach Synced"
+          command: >
+            kubectl wait application
+            cert-manager ingress-nginx sealed-secrets local-path-provisioner
+            -n {{ argocd_namespace }}
+            --for=jsonpath='{.status.sync.status}'=Synced
+            --timeout=300s
+          register: system_sync_wait
+
+        - name: "[WAIT] Wait for system applications to reach Healthy"
+          command: >
+            kubectl wait application
+            cert-manager ingress-nginx sealed-secrets local-path-provisioner
+            -n {{ argocd_namespace }}
+            --for=jsonpath='{.status.health.status}'=Healthy
+            --timeout=300s
+          register: system_health_wait
+
+        - name: "[WAIT] Wait for monitoring applications to reach Synced"
+          command: >
+            kubectl wait application
+            prometheus-stack loki promtail blackbox-exporter
+            -n {{ argocd_namespace }}
+            --for=jsonpath='{.status.sync.status}'=Synced
+            --timeout=600s
+          register: monitoring_sync_wait
+
+        - name: "[WAIT] Wait for monitoring applications to reach Healthy"
+          command: >
+            kubectl wait application
+            prometheus-stack loki promtail blackbox-exporter
+            -n {{ argocd_namespace }}
+            --for=jsonpath='{.status.health.status}'=Healthy
+            --timeout=600s
+          register: monitoring_health_wait
+
+        - name: "[OK] GitOps bootstrap complete"
+          debug:
+            msg: |
+              Bootstrap complete. ArgoCD is managing the cluster.
+
+              Application sync status:
+                kubectl get applications -n {{ argocd_namespace }}
+
+              ArgoCD UI:
+                kubectl port-forward svc/argocd-server -n {{ argocd_namespace }} 8080:443
+                https://localhost:8080
+
+              Grafana:
+                kubectl port-forward svc/prometheus-stack-grafana -n monitoring 3000:80
+                http://localhost:3000
+
+      rescue:
+        - name: "[ERROR] Failed"
+          debug:
+            msg: |
+              Applying infrastructure or monitoring app failed.
+              Validate: kubectl apply --dry-run=client -f {{ bootstrap_manifests_path }}/infrastructure-app.yaml
+              ArgoCD pods: kubectl get pods -n {{ argocd_namespace }}
+
+        - name: "[FAIL] Stop after infrastructure or monitoring bootstrap failure"
+          fail:
+            msg: "infrastructure/monitoring bootstrap failed."

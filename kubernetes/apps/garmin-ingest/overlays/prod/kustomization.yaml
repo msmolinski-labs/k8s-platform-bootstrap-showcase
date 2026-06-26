@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - db-sealed-secret.yaml
+  - auth-sealed-secret.yaml
+
+images:
+  - name: ghcr.io/msmolinski-labs/garmin-ingest
+    newTag: latest
+
+patches:
+  - path: patch-domain.yaml
+    target:
+      kind: Ingress
+      name: garmin-ingest-ingress
+  - path: patch-cnpg.yaml
+    target:
+      kind: Cluster
+      name: postgres-garmin-ingest

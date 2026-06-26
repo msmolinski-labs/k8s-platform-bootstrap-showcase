@@ -1,0 +1,178 @@
+---
+
+- name: "=== TEARDOWN: Uninstall Cilium and ArgoCD via Helm ==="
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    teardown_env_name: "{{ ansible_inventory_sources[0] | dirname | basename }}"
+
+  tasks:
+
+    - name: "[SAFETY] Confirm teardown"
+      fail:
+        msg: |
+          Teardown requires explicit confirmation.
+
+          Re-run with:
+            -e "confirm_teardown=yes"
+      when: confirm_teardown is not defined or confirm_teardown != "yes"
+
+    - name: "[PRE-CHECK] Get current kubectl context"
+      command: kubectl config current-context
+      register: current_kubectl_context
+      changed_when: false
+
+    - name: "[SAFETY] Fail on kubectl context/environment mismatch"
+      fail:
+        msg: |
+          kubectl context/environment mismatch detected.
+
+          Inventory selects environment: {{ teardown_env_name }}
+          Current kubectl context: {{ current_kubectl_context.stdout }}
+          Expected kubectl context: {{ teardown_env_name }}
+
+          This teardown first uninstalls ArgoCD and Cilium from localhost using Helm.
+          Switch context before retrying:
+            kubectl config use-context {{ teardown_env_name }}
+      when: current_kubectl_context.stdout != teardown_env_name
+
+    - name: "[TEARDOWN] Uninstall ArgoCD via Helm"
+      command: helm uninstall argocd -n argocd
+      ignore_errors: true
+
+    - name: "[TEARDOWN] Uninstall Cilium via Helm"
+      command: helm uninstall cilium -n kube-system
+      ignore_errors: true
+
+    - name: "[TEARDOWN] Wait 30s for Cilium to drain iptables rules"
+      pause:
+        seconds: 30
+
+- name: "=== TEARDOWN: Reset all cluster nodes ==="
+  hosts: control_plane:workers
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: "[SAFETY] Confirm teardown"
+      fail:
+        msg: |
+          Teardown requires explicit confirmation.
+
+          Re-run with:
+            -e "confirm_teardown=yes"
+      when: confirm_teardown is not defined or confirm_teardown != "yes"
+
+    - name: "[TEARDOWN] Reset kubeadm on all nodes"
+      block:
+
+        - name: Run kubeadm reset
+          command: kubeadm reset -f
+          register: reset_output
+          ignore_errors: true
+
+        - name: Print reset output
+          debug:
+            msg: "{{ reset_output.stdout_lines | default([]) }}"
+
+        - name: Remove CNI residues
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/cni/net.d
+            - /opt/cni/bin
+            - /var/lib/cni
+
+        - name: Remove kubeadm/kubelet residues
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/kubernetes
+            - /var/lib/etcd
+            - /var/lib/kubelet
+            - /root/.kube
+
+        - name: Reboot node to clear iptables rules
+          reboot:
+            reboot_timeout: 120
+          ignore_errors: true
+
+        - name: "[OK] Node reset complete"
+          debug:
+            msg: "{{ inventory_hostname }} reset successfully."
+
+      rescue:
+        - name: "[WARNING] Node reset encountered errors"
+          debug:
+            msg: |
+              Reset on {{ inventory_hostname }} encountered errors.
+              Verify manually that /etc/kubernetes has been removed.
+
+- name: "=== TEARDOWN: Wipe MinIO storage node ==="
+  hosts: storage_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: "[SAFETY] Confirm teardown"
+      fail:
+        msg: "Teardown requires -e confirm_teardown=yes"
+      when: confirm_teardown is not defined or confirm_teardown != "yes"
+
+    - name: "[TEARDOWN] Stop MinIO service"
+      systemd:
+        name: minio
+        state: stopped
+      ignore_errors: true
+
+    - name: "[TEARDOWN] Wipe MinIO data directory"
+      file:
+        path: /data/minio
+        state: absent
+
+    - name: "[TEARDOWN] Recreate empty data directory"
+      file:
+        path: /data/minio
+        state: directory
+        owner: minio-user
+        group: minio-user
+        mode: '0750'
+
+    - name: "[OK] MinIO wiped"
+      debug:
+        msg: "MinIO data wiped. Service left stopped – bootstrap will restart it."
+
+- name: "=== TEARDOWN: Clean up local environment ==="
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "[SAFETY] Confirm teardown"
+      fail:
+        msg: "Teardown requires -e confirm_teardown=yes"
+      when: confirm_teardown is not defined or confirm_teardown != "yes"
+
+    - name: "[KUBECONFIG] Remove context for torn-down environment"
+      shell: |
+        ENV=$(basename $(dirname "{{ ansible_inventory_sources[0] }}"))
+        kubectl config delete-context "${ENV}" 2>/dev/null || true
+        kubectl config delete-cluster "${ENV}" 2>/dev/null || true
+        kubectl config delete-user "${ENV}-admin" 2>/dev/null || true
+      ignore_errors: true
+
+    - name: "[DONE] Teardown complete"
+      debug:
+        msg: |
+          Cluster destroyed. kubeconfig context removed.
+          MinIO data wiped.
+
+          To rebuild:
+            bash scripts/bootstrap.sh --inventory {{ ansible_inventory_sources[0] }}

@@ -1,0 +1,14 @@
+extends: default
+
+ignore: |
+  ansible/**/secrets.sops.yaml
+  kubernetes/apps/monitoring/base/*sealed-secret.yaml
+  kubernetes/apps/monitoring/dashboards/*.yaml
+
+rules:
+  document-start: disable
+  line-length: disable
+  truthy: disable
+  empty-lines: disable
+  braces: disable
+  commas: disable
