@@ -1,0 +1,50 @@
+name: Validate Repository Consistency
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install validation dependencies
+        run: python -m pip install --upgrade pip -r requirements-dev.txt
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/bootstrap.sh
+          bash -n scripts/setup-lb.sh
+          bash -n scripts/teardown.sh
+          bash -n scripts/teardown-lb.sh
+          shellcheck -x scripts/bootstrap.sh scripts/setup-lb.sh scripts/teardown.sh scripts/teardown-lb.sh scripts/lib/inventory.sh
+
+      - name: Lint YAML
+        run: yamllint -c .yamllint .github/workflows ansible kubernetes
+
+      - name: Validate Kustomize overlays
+        run: |
+          kubectl kustomize kubernetes/infrastructure/overlays/dev >/dev/null
+          kubectl kustomize kubernetes/infrastructure/overlays/prod >/dev/null
+          kubectl kustomize kubernetes/apps/monitoring/overlays/dev >/dev/null
+          kubectl kustomize kubernetes/apps/monitoring/overlays/prod >/dev/null
+
+      - name: Validate repository consistency
+        run: python3 scripts/validate_repo.py

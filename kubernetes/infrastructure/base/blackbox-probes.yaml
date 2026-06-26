@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: http-endpoints
+  namespace: monitoring
+  labels:
+    release: prometheus-stack
+spec:
+  jobName: blackbox
+  prober:
+    url: blackbox-exporter-prometheus-blackbox-exporter.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://argocd.klexify.io
+        - https://grafana.klexify.io
+  interval: 60s
+  scrapeTimeout: 10s

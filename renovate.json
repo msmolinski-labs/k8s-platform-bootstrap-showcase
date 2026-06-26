@@ -1,0 +1,70 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "schedule": [
+    "before 6am on Monday"
+  ],
+  "timezone": "Europe/Warsaw",
+  "dependencyDashboard": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/kubernetes/apps/monitoring/base/prometheus-stack\\.yaml$/",
+        "/kubernetes/apps/monitoring/base/blackbox-exporter\\.yaml$/"
+      ],
+      "matchStrings": [
+        "chart: (?<depName>[^\\n]+)\\n\\s+targetRevision: \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "helm",
+      "registryUrlTemplate": "https://prometheus-community.github.io/helm-charts"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/kubernetes/apps/monitoring/base/loki\\.yaml$/",
+        "/kubernetes/apps/monitoring/base/promtail\\.yaml$/"
+      ],
+      "matchStrings": [
+        "chart: (?<depName>[^\\n]+)\\n\\s+targetRevision: \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "helm",
+      "registryUrlTemplate": "https://grafana.github.io/helm-charts"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/kubernetes/system/cert-manager\\.yaml$/"
+      ],
+      "matchStrings": [
+        "chart: (?<depName>[^\\n]+)\\n\\s+targetRevision: \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "helm",
+      "registryUrlTemplate": "https://charts.jetstack.io"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/kubernetes/system/ingress-nginx\\.yaml$/"
+      ],
+      "matchStrings": [
+        "chart: (?<depName>[^\\n]+)\\n\\s+targetRevision: \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "helm",
+      "registryUrlTemplate": "https://kubernetes.github.io/ingress-nginx"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/kubernetes/system/sealed-secrets\\.yaml$/"
+      ],
+      "matchStrings": [
+        "chart: (?<depName>[^\\n]+)\\n\\s+targetRevision: \"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "helm",
+      "registryUrlTemplate": "https://bitnami-labs.github.io/sealed-secrets"
+    }
+  ]
+}

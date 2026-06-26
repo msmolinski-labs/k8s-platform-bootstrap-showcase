@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - redis.yaml
+  - cnpg-cluster.yaml
+  - db-migrate-job.yaml
+  - deployment-api.yaml
+  - deployment-worker.yaml
+  - service-api.yaml
+  - ingress.yaml

@@ -1,0 +1,198 @@
+---
+- name: "[MINIO] Prepare MinIO server"
+  hosts: storage_nodes
+  become: true
+
+  tasks:
+
+    - name: "[PACKAGES] Update apt cache"
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: "[PACKAGES] Install required packages"
+      apt:
+        name:
+          - ufw
+          - curl
+          - wget
+        state: present
+
+    - name: "[HOST] Set hostname"
+      hostname:
+        name: hulk
+
+    - name: "[UFW] Reset UFW to defaults"
+      ufw:
+        state: reset
+
+    - name: "[UFW] Allow SSH"
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: "[UFW] Allow MinIO API from cluster nodes only"
+      ufw:
+        rule: allow
+        port: "{{ minio_port }}"
+        proto: tcp
+        src: "{{ hostvars[item]['ansible_host'] }}"
+      loop: "{{ groups['control_plane'] + groups['workers'] }}"
+
+    - name: "[UFW] Allow MinIO Console via SSH tunnel only (localhost)"
+      ufw:
+        rule: allow
+        port: "9001"
+        proto: tcp
+        src: 127.0.0.1
+
+    - name: "[UFW] Enable UFW"
+      ufw:
+        state: enabled
+        policy: deny
+
+    - name: "[MINIO] Create minio system user"
+      user:
+        name: minio-user
+        system: yes
+        shell: /sbin/nologin
+        create_home: no
+
+    - name: "[MINIO] Create MinIO data directory"
+      file:
+        path: /data/minio
+        state: directory
+        owner: minio-user
+        group: minio-user
+        mode: '0750'
+
+    - name: "[MINIO] Check if MinIO binary already exists"
+      stat:
+        path: /usr/local/bin/minio
+      register: minio_binary
+
+    - name: "[MINIO] Download MinIO binary"
+      get_url:
+        url: https://dl.min.io/server/minio/release/linux-amd64/minio
+        dest: /usr/local/bin/minio
+        mode: '0755'
+      when: not minio_binary.stat.exists
+
+    - name: "[MC] Check if mc binary already exists"
+      stat:
+        path: /usr/local/bin/mc
+      register: mc_binary
+
+    - name: "[MC] Download MinIO Client (mc)"
+      get_url:
+        url: https://dl.min.io/client/mc/release/linux-amd64/mc
+        dest: /usr/local/bin/mc
+        mode: '0755'
+      when: not mc_binary.stat.exists
+
+    - name: "[MINIO] Create MinIO environment file"
+      copy:
+        dest: /etc/default/minio
+        mode: '0600'
+        owner: minio-user
+        content: |
+          MINIO_VOLUMES="/data/minio"
+          MINIO_ROOT_USER={{ minio_root_user }}
+          MINIO_ROOT_PASSWORD={{ minio_root_password }}
+          MINIO_SITE_NAME="storage-minio"
+
+    - name: "[MINIO] Create MinIO systemd service"
+      copy:
+        dest: /etc/systemd/system/minio.service
+        content: |
+          [Unit]
+          Description=MinIO Object Storage
+          Documentation=https://docs.min.io
+          Wants=network-online.target
+          After=network-online.target
+          AssertFileIsExecutable=/usr/local/bin/minio
+
+          [Service]
+          WorkingDirectory=/data/minio
+          User=minio-user
+          Group=minio-user
+          EnvironmentFile=/etc/default/minio
+          ExecStartPre=/bin/bash -c "if [ -z \"${MINIO_VOLUMES}\" ]; then echo \"Variable MINIO_VOLUMES not set\"; exit 1; fi"
+          ExecStart=/usr/local/bin/minio server $MINIO_VOLUMES \
+            --console-address ":9001"
+          Restart=always
+          LimitNOFILE=65536
+          TasksMax=infinity
+          TimeoutStopSec=infinity
+          SendSIGKILL=no
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "[MINIO] Enable and restart MinIO service"
+      systemd:
+        name: minio
+        enabled: yes
+        state: restarted
+        daemon_reload: yes
+
+    - name: "[WAIT] Wait for MinIO to become available"
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ minio_port }}"
+        timeout: 30
+
+    - name: "[MC] Configure mc alias for local MinIO"
+      command: >
+        mc alias set local
+        http://127.0.0.1:{{ minio_port }}
+        {{ minio_root_user }}
+        {{ minio_root_password }}
+      changed_when: false
+
+    - name: "[MC] Check if loki bucket exists"
+      command: mc ls local/{{ minio_loki_bucket }}
+      register: bucket_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[MC] Create loki bucket"
+      command: mc mb local/{{ minio_loki_bucket }}
+      when: bucket_check.rc != 0
+
+    - name: "[MC] Check if loki user exists"
+      command: mc admin user info local {{ minio_loki_user }}
+      register: user_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[MC] Create loki user"
+      command: >
+        mc admin user add local
+        {{ minio_loki_user }}
+        {{ vault_minio_loki_secret_key }}
+      when: user_check.rc != 0
+
+    - name: "[MC] Attach readwrite policy to loki user"
+      command: >
+        mc admin policy attach local readwrite
+        --user {{ minio_loki_user }}
+      when: user_check.rc != 0
+
+    - name: "[MC] Set loki user password (always – ensures vault and MinIO are in sync)"
+      command: >
+        mc admin user add local
+        {{ minio_loki_user }}
+        {{ minio_loki_secret_key }}
+
+    - name: "[OK] MinIO ready"
+      debug:
+        msg: |
+          MinIO is running and provisioned:
+            Bucket: {{ minio_loki_bucket }}
+            User:   {{ minio_loki_user }}
+
+          Access MinIO Console via SSH tunnel:
+            ssh -L 9001:127.0.0.1:9001 root@{{ ansible_host }}
+            Open: http://localhost:9001

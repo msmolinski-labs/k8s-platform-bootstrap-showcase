@@ -1,0 +1,12 @@
+---
+
+base_domain: "dev-klexify.cloud"
+
+lb_ip: "87.106.21.4"
+nginx_upstream_port: "30080"
+nginx_upstream_port_ssl: "30443"
+
+cloudflare_proxy_enabled: true
+
+cloudflare_origin_cert_src: "~/.cloudflare/dev-klexify.cloud-origin.pem"
+cloudflare_origin_key_src: "~/.cloudflare/dev-klexify.cloud-origin.key"
