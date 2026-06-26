@@ -1,0 +1,87 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: garmin-ingest
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: garmin-ingest
+        app.kubernetes.io/component: db-migrate
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      initContainers:
+        - name: copy-migrations
+          image: ghcr.io/msmolinski-labs/garmin-ingest:latest
+          command: ["sh", "-c", "cp /app/db/migrations/*.sql /migrations/"]
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+      containers:
+        - name: migrate
+          image: postgres:17-alpine
+          envFrom:
+            - secretRef:
+                name: garmin-ingest-db-credentials
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              export PGHOST="$DB_HOST"
+              export PGPORT="$DB_PORT"
+              export PGUSER="$DB_USER"
+              export PGPASSWORD="$DB_PASSWORD"
+              export PGDATABASE="$DB_NAME"
+
+              echo "Waiting for PostgreSQL at $PGHOST:$PGPORT..."
+              for i in $(seq 1 24); do
+                if pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" >/dev/null 2>&1; then
+                  echo "PostgreSQL is ready."
+                  break
+                fi
+                if [ "$i" = "24" ]; then
+                  echo "ERROR: PostgreSQL not ready after 120s"
+                  exit 1
+                fi
+                echo "  not ready yet, retrying in 5s... ($i/24)"
+                sleep 5
+              done
+
+              psql -c "CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_name TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+              );"
+
+              for f in $(ls /migrations/*.sql | sort); do
+                name=$(basename "$f")
+                already=$(psql -tAc "SELECT 1 FROM schema_migrations WHERE migration_name='$name'" || true)
+                if [ "$already" = "1" ]; then
+                  echo "Skipping (already applied): $name"
+                else
+                  echo "Applying migration: $name"
+                  psql -f "$f"
+                  psql -c "INSERT INTO schema_migrations (migration_name) VALUES ('$name') ON CONFLICT DO NOTHING;"
+                  echo "Applied: $name"
+                fi
+              done
+              echo "All migrations complete."
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: migrations
+          emptyDir: {}
+      restartPolicy: Never
+  backoffLimit: 5

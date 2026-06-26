@@ -1,0 +1,74 @@
+---
+- name: "[RUNTIME] Install and configure containerd"
+  hosts: control_plane:workers
+  become: true
+
+  tasks:
+
+    - name: "[PACKAGES] Install required packages"
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - conntrack
+          - socat
+        state: present
+        update_cache: yes
+
+    - name: "[REPO] Create keyrings directory"
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: "[REPO] Add Docker GPG key"
+      shell: |
+        curl -fsSL --max-time 30 --retry 5 --retry-delay 10 https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+      changed_when: true
+
+    - name: "[REPO] Add Docker repository"
+      shell: |
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" > /etc/apt/sources.list.d/docker.list
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: "[INSTALL] Install containerd"
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: "[CONFIG] Create containerd config directory"
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: "[CONFIG] Generate default containerd config"
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: "[CONFIG] Remove disabled_plugins line (enables CRI plugin)"
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^disabled_plugins.*'
+        state: absent
+
+    - name: "[CONFIG] Enable SystemdCgroup"
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: "[SERVICE] Enable and restart containerd"
+      systemd:
+        name: containerd
+        enabled: yes
+        state: restarted
+
+    - name: "[WAIT] Wait for containerd socket"
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        timeout: 30

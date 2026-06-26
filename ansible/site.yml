@@ -1,0 +1,92 @@
+---
+
+- name: "=== PHASE 1: Connectivity checks – cluster nodes ==="
+  hosts: control_plane:workers
+  gather_facts: false
+  tags: preflight
+
+  tasks:
+    - name: "[PRE-FLIGHT] Ping all cluster nodes"
+      ping:
+
+    - name: "[PRE-FLIGHT] Check Ubuntu version"
+      raw: lsb_release -rs
+      register: ubuntu_version
+      changed_when: false
+
+    - name: "[PRE-FLIGHT] Print OS version"
+      debug:
+        msg: "{{ inventory_hostname }}: Ubuntu {{ ubuntu_version.stdout | trim }}"
+
+    - name: "[PRE-FLIGHT] Require Ubuntu 24.04"
+      fail:
+        msg: >
+          {{ inventory_hostname }} is not running Ubuntu 24.04.
+          Found: {{ ubuntu_version.stdout | trim }}
+      when: "'24.04' not in ubuntu_version.stdout"
+
+- name: "=== PHASE 1: Connectivity checks – storage node ==="
+  hosts: storage_nodes
+  gather_facts: false
+  tags: preflight
+
+  tasks:
+    - name: "[PRE-FLIGHT] Ping storage node"
+      ping:
+
+    - name: "[PRE-FLIGHT] Check Ubuntu version on storage"
+      raw: lsb_release -rs
+      register: ubuntu_version
+      changed_when: false
+
+    - name: "[PRE-FLIGHT] Print OS version"
+      debug:
+        msg: "{{ inventory_hostname }}: Ubuntu {{ ubuntu_version.stdout | trim }}"
+
+- name: "=== PHASE 2: Prepare cluster nodes ==="
+  import_playbook: playbooks/01-prepare-servers.yml
+  tags: prepare
+
+- name: "=== PHASE 3: Install containerd ==="
+  import_playbook: playbooks/02-install-containerd.yml
+  tags: containerd
+
+- name: "=== PHASE 4: Install Kubernetes packages ==="
+  import_playbook: playbooks/03-install-kubernetes.yml
+  tags: kubernetes
+
+- name: "=== PHASE 4b: Configure UFW firewall ==="
+  import_playbook: playbooks/01b-configure-ufw.yml
+  tags: firewall
+
+- name: "=== PHASE 5: Prepare MinIO storage ==="
+  import_playbook: playbooks/04-prepare-minio.yml
+  tags: minio
+
+- name: "=== PHASE 6: Initialize cluster (kubeadm init) ==="
+  import_playbook: playbooks/05-init-cluster.yml
+  tags: init
+
+- name: "=== PHASE 7: Join worker nodes ==="
+  import_playbook: playbooks/06-join-workers.yml
+  tags: workers
+
+- name: "=== PHASE 8: Install Cilium CNI ==="
+  import_playbook: playbooks/07-install-cilium.yml
+  tags: cilium
+
+- name: "=== PHASE 9: Install ArgoCD ==="
+  import_playbook: playbooks/08-install-argocd.yml
+  tags: argocd
+
+- name: "=== PHASE 10: Bootstrap GitOps – system-app ==="
+  import_playbook: playbooks/09-bootstrap-gitops.yml
+  tags: gitops
+
+- name: "=== PHASE 11: Seal monitoring secrets ==="
+  import_playbook: playbooks/10-seal-secrets.yml
+  tags: seal_secrets
+
+- name: "=== PHASE 12: Bootstrap GitOps – infrastructure + monitoring ==="
+  import_playbook: playbooks/11-apply-monitoring.yml
+  tags: monitoring

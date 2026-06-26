@@ -1,0 +1,393 @@
+---
+
+- name: "[APP] Deploy garmin-ingest application"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    overlay_dir: "{{ repo_root }}/kubernetes/apps/garmin-ingest/overlays/{{ env_name }}"
+    secrets_file: "{{ repo_root }}/ansible/inventory/{{ env_name }}/group_vars/all/secrets.sops.yaml"
+    sops_helper: "{{ repo_root }}/scripts/sops_secrets.py"
+    sops_age_recipients: "{{ lookup('env', 'BOOTSTRAP_SOPS_AGE_RECIPIENTS') | default(lookup('env', 'SOPS_AGE_RECIPIENTS'), true) }}"
+    ghcr_username: "{{ lookup('env', 'BOOTSTRAP_GHCR_USERNAME') | default('', true) }}"
+    ghcr_token: "{{ lookup('env', 'BOOTSTRAP_GHCR_TOKEN') | default('', true) }}"
+    passwords_file: "{{ repo_root }}/passwords-garmin-{{ env_name }}-temp.txt"
+    bootstrap_manifests_path: "/tmp/k8s-cluster-bootstrap/garmin-ingest/{{ env_name }}"
+    expected_git_branch: "{{ 'main' if env_name == 'prod' else env_name }}"
+    git_branch: "{{ 'main' if env_name == 'prod' else env_name }}"
+    github_org: "msmolinski-labs"
+    github_repo: "k8s-cluster-bootstrap"
+
+  tasks:
+
+    - name: "[PRE-CHECK] Require env_name parameter"
+      fail:
+        msg: |
+          Missing required parameter: env_name
+          Usage: ansible-playbook 13-deploy-garmin-ingest.yml -e env_name=dev
+      when: env_name is not defined
+
+    - name: "[PRE-CHECK] Require supported environment name"
+      fail:
+        msg: |
+          Unsupported environment: {{ env_name }}
+          Expected: dev or prod
+      when: env_name not in ['dev', 'prod']
+
+    - name: "[PRE-CHECK] Verify secrets.sops.yaml exists"
+      stat:
+        path: "{{ secrets_file }}"
+      register: secrets_stat
+
+    - name: "[PRE-CHECK] Fail if secrets.sops.yaml missing"
+      fail:
+        msg: |
+          Secrets file not found: {{ secrets_file }}
+          Run bootstrap.sh first to create the encrypted secrets file.
+      when: not secrets_stat.stat.exists
+
+    - name: "[PRE-CHECK] Verify sops is installed"
+      command: which sops
+      changed_when: false
+
+    - name: "[PRE-CHECK] Get current git branch"
+      command: git -C "{{ repo_root }}" rev-parse --abbrev-ref HEAD
+      register: current_branch
+      changed_when: false
+
+    - name: "[PRE-CHECK] Fail on git branch mismatch"
+      fail:
+        msg: |
+          Git branch mismatch.
+          Environment: {{ env_name }}
+          Current branch: {{ current_branch.stdout }}
+          Expected branch: {{ expected_git_branch }}
+      when: current_branch.stdout != expected_git_branch
+
+    - name: "[PRE-CHECK] Get current kubectl context"
+      command: kubectl config current-context
+      register: current_context
+      changed_when: false
+
+    - name: "[PRE-CHECK] Fail on kubectl context mismatch"
+      fail:
+        msg: |
+          kubectl context does not match environment.
+          Environment: {{ env_name }}
+          Current context: {{ current_context.stdout }}
+          Expected context: {{ env_name }}
+
+          Switch with: kubectl config use-context {{ env_name }}
+      when: current_context.stdout != env_name
+
+    - name: "[PRE-CHECK] Verify ArgoCD is available"
+      command: kubectl get deployment argocd-server -n argocd -o name
+      changed_when: false
+
+    - name: "[PRE-CHECK] Verify Sealed Secrets controller is ready"
+      command: >
+        kubectl rollout status deployment/sealed-secrets
+        -n kube-system --timeout=180s
+      changed_when: false
+
+    - name: "[CNPG] Check if CloudNativePG operator is installed"
+      command: kubectl get deployment cloudnative-pg -n cnpg-system -o name
+      register: cnpg_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[CNPG] Apply CloudNativePG operator ArgoCD Application"
+      command: kubectl apply -f "{{ repo_root }}/kubernetes/system/cloudnative-pg-operator.yaml"
+      when: cnpg_check.rc != 0
+      changed_when: true
+
+    - name: "[CNPG] Wait for ArgoCD to sync CNPG operator"
+      command: >
+        kubectl get deployment cloudnative-pg -n cnpg-system -o name
+      register: cnpg_deploy_check
+      until: cnpg_deploy_check.rc == 0
+      retries: 30
+      delay: 10
+      when: cnpg_check.rc != 0
+      changed_when: false
+
+    - name: "[CNPG] Wait for operator deployment to be ready (5 min)"
+      command: >
+        kubectl rollout status deployment/cloudnative-pg
+        -n cnpg-system --timeout=300s
+      when: cnpg_check.rc != 0
+      changed_when: false
+
+    - name: "[PRE-CHECK] Verify kubeseal is installed"
+      command: which kubeseal
+      changed_when: false
+
+    - name: "[PRE-CHECK] Require GHCR credentials for image pull secret sealing"
+      fail:
+        msg: |
+          Missing BOOTSTRAP_GHCR_USERNAME or BOOTSTRAP_GHCR_TOKEN.
+          garmin-ingest deploy must create ghcr-pull-secret per environment.
+      when: ghcr_username | length == 0 or ghcr_token | length == 0
+
+    - name: "[PRE-CHECK] Verify git push access (dry-run)"
+      command: git -C "{{ repo_root }}" push --dry-run origin HEAD
+      register: git_remote_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[PRE-CHECK] Fail if cannot push to git remote"
+      fail:
+        msg: |
+          Cannot push to git remote. Sealed secrets cannot be committed.
+          Fix git authentication before running this playbook.
+      when: git_remote_check.rc != 0
+
+    - name: "[CREDS] Read secrets.sops.yaml"
+      command: >
+        python3 {{ sops_helper }} dump-json --file {{ secrets_file }}
+      register: secrets_json
+      changed_when: false
+      no_log: true
+
+    - name: "[CREDS] Parse SOPS YAML"
+      set_fact:
+        secrets_data: "{{ secrets_json.stdout | from_json }}"
+      no_log: true
+
+    - name: "[CREDS] Check if garmin credentials exist"
+      set_fact:
+        _garmin_creds_exist: "{{ secrets_data.vault_garmin_db_password is defined }}"
+
+    - name: "[CREDS] Use existing credentials from secrets.sops.yaml"
+      set_fact:
+        _garmin_db_user: "{{ secrets_data.vault_garmin_db_user }}"
+        _garmin_db_password: "{{ secrets_data.vault_garmin_db_password }}"
+        _garmin_auth_username: "{{ secrets_data.vault_garmin_auth_username }}"
+        _garmin_auth_password: "{{ secrets_data.vault_garmin_auth_password }}"
+      when: _garmin_creds_exist | bool
+      no_log: true
+
+    - name: "[CREDS] Generate new credentials"
+      set_fact:
+        _garmin_db_user: "garmin"
+        _garmin_db_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=24') }}"
+        _garmin_auth_username: "admin"
+        _garmin_auth_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=24') }}"
+      when: not (_garmin_creds_exist | bool)
+
+    - name: "[CREDS] Persist garmin credentials in secrets.sops.yaml"
+      command: >
+        python3 {{ sops_helper }} upsert --file {{ secrets_file }}
+        --age-recipients {{ sops_age_recipients | quote }}
+        --set {{ ('vault_garmin_db_user=' ~ _garmin_db_user) | quote }}
+        --set {{ ('vault_garmin_db_password=' ~ _garmin_db_password) | quote }}
+        --set {{ ('vault_garmin_auth_username=' ~ _garmin_auth_username) | quote }}
+        --set {{ ('vault_garmin_auth_password=' ~ _garmin_auth_password) | quote }}
+      when: not (_garmin_creds_exist | bool)
+      changed_when: true
+      no_log: true
+
+    - name: "[CREDS] Credentials status"
+      debug:
+        msg: "{{ 'New garmin credentials generated and saved to secrets.sops.yaml.' if not (_garmin_creds_exist | bool) else 'Reusing existing garmin credentials from secrets.sops.yaml.' }}"
+
+    - name: "[SEAL] garmin-ingest-db-credentials – write temp files"
+      copy:
+        dest: "{{ item.dest }}"
+        mode: '0600'
+        content: "{{ item.content }}"
+      loop:
+        - { dest: /tmp/garmin-db-username, content: "{{ _garmin_db_user }}" }
+        - { dest: /tmp/garmin-db-password, content: "{{ _garmin_db_password }}" }
+      no_log: true
+
+    - name: "[SEAL] garmin-ingest-db-credentials – seal from files"
+      shell: |
+        kubectl create secret generic garmin-ingest-db-credentials \
+          --from-file=username=/tmp/garmin-db-username \
+          --from-file=password=/tmp/garmin-db-password \
+          --from-literal=DB_HOST=postgres-garmin-ingest-rw.garmin-ingest.svc \
+          --from-literal=DB_PORT=5432 \
+          --from-literal=DB_NAME=garmin_ingest \
+          --from-literal=DB_USER={{ _garmin_db_user }} \
+          --from-literal=DB_PASSWORD={{ _garmin_db_password }} \
+          --namespace garmin-ingest \
+          --dry-run=client -o yaml | \
+        kubeseal --format yaml \
+          --controller-name sealed-secrets \
+          --controller-namespace kube-system \
+            > "{{ overlay_dir }}/db-sealed-secret.yaml"
+      changed_when: true
+      no_log: true
+
+    - name: "[SEAL] garmin-ingest-db-credentials – remove temp files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/garmin-db-username
+        - /tmp/garmin-db-password
+
+    - name: "[SEAL] garmin-ingest-auth-credentials – write temp files"
+      copy:
+        dest: "{{ item.dest }}"
+        mode: '0600'
+        content: "{{ item.content }}"
+      loop:
+        - { dest: /tmp/garmin-auth-username, content: "{{ _garmin_auth_username }}" }
+        - { dest: /tmp/garmin-auth-password, content: "{{ _garmin_auth_password }}" }
+      no_log: true
+
+    - name: "[SEAL] garmin-ingest-auth-credentials – seal from files"
+      shell: |
+        kubectl create secret generic garmin-ingest-auth-credentials \
+          --from-literal=WRITE_AUTH_USERNAME={{ _garmin_auth_username }} \
+          --from-literal=WRITE_AUTH_PASSWORD={{ _garmin_auth_password }} \
+          --namespace garmin-ingest \
+          --dry-run=client -o yaml | \
+        kubeseal --format yaml \
+          --controller-name sealed-secrets \
+          --controller-namespace kube-system \
+            > "{{ overlay_dir }}/auth-sealed-secret.yaml"
+      changed_when: true
+      no_log: true
+
+    - name: "[SEAL] garmin-ingest-auth-credentials – remove temp files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/garmin-auth-username
+        - /tmp/garmin-auth-password
+
+    - name: "[APPLY] ghcr-pull-secret – apply docker registry secret"
+      shell: |
+        kubectl create secret docker-registry ghcr-pull-secret \
+          --docker-server=ghcr.io \
+          --docker-username={{ ghcr_username | quote }} \
+          --docker-password={{ ghcr_token | quote }} \
+          --namespace garmin-ingest \
+          --dry-run=client -o yaml | \
+        kubectl apply -f -
+      changed_when: true
+      no_log: true
+
+    - name: "[OK] garmin-ingest secrets prepared"
+      debug:
+        msg: "SealedSecrets generated in {{ overlay_dir }} and ghcr-pull-secret applied in cluster."
+
+    - name: "[GIT] Stage sealed secrets and kustomization"
+      command: git -C "{{ repo_root }}" add "{{ overlay_dir }}" "{{ secrets_file }}"
+      changed_when: true
+
+    - name: "[GIT] Check if there are changes to commit"
+      command: git -C "{{ repo_root }}" status --porcelain "{{ overlay_dir }}" "{{ secrets_file }}"
+      register: git_status
+      changed_when: false
+
+    - name: "[GIT] Commit sealed secrets"
+      command: >
+        git -C "{{ repo_root }}"
+        commit -m "chore(secrets): seal garmin-ingest secrets for {{ env_name }} [deploy]"
+      when: git_status.stdout != ""
+      changed_when: true
+
+    - name: "[GIT] Push to current branch"
+      command: git -C "{{ repo_root }}" push origin {{ current_branch.stdout }}
+      when: git_status.stdout != ""
+      changed_when: true
+
+    - name: "[INFO] No secret changes to commit"
+      debug:
+        msg: "SealedSecrets unchanged – skipping git commit."
+      when: git_status.stdout == ""
+
+    - name: "[ARGOCD] Ensure temp manifest directory exists"
+      file:
+        path: "{{ bootstrap_manifests_path }}"
+        state: directory
+        mode: '0700'
+
+    - name: "[ARGOCD] Generate garmin-ingest Application manifest"
+      copy:
+        dest: "{{ bootstrap_manifests_path }}/garmin-ingest-app.yaml"
+        content: |
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: garmin-ingest
+            namespace: argocd
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            project: default
+            source:
+              repoURL: https://github.com/{{ github_org }}/{{ github_repo }}.git
+              targetRevision: {{ git_branch }}
+              path: kubernetes/apps/garmin-ingest/overlays/{{ env_name }}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: garmin-ingest
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+
+    - name: "[ARGOCD] Apply garmin-ingest Application"
+      command: kubectl apply -f {{ bootstrap_manifests_path }}/garmin-ingest-app.yaml
+      register: app_apply
+
+    - name: "[OK] ArgoCD Application created"
+      debug:
+        msg: "{{ app_apply.stdout_lines }}"
+
+    - name: "[WAIT] Wait for garmin-ingest to be synced (10 min)"
+      command: >
+        kubectl wait application/garmin-ingest
+        -n argocd
+        --for=jsonpath='{.status.sync.status}'=Synced
+        --timeout=600s
+      changed_when: false
+
+    - name: "[WAIT] Wait for garmin-ingest to be healthy (10 min)"
+      command: >
+        kubectl wait application/garmin-ingest
+        -n argocd
+        --for=jsonpath='{.status.health.status}'=Healthy
+        --timeout=600s
+      changed_when: false
+
+    - name: "[SAVE] Write credentials to temp file"
+      copy:
+        dest: "{{ passwords_file }}"
+        mode: "0600"
+        content: |
+
+          DB user:        {{ _garmin_db_user }}
+          DB password:    {{ _garmin_db_password }}
+          Auth username:  {{ _garmin_auth_username }}
+          Auth password:  {{ _garmin_auth_password }}
+
+            Secrets file:   {{ secrets_file }}
+            To view later:  sops decrypt {{ secrets_file }}
+      no_log: true
+
+    - name: "[DONE] garmin-ingest deployed successfully"
+      debug:
+        msg: |
+          garmin-ingest deployed on {{ env_name }}.
+
+          ArgoCD Application: garmin-ingest
+          Namespace:          garmin-ingest
+          Branch:             {{ git_branch }}
+
+          Credentials saved to: {{ passwords_file }}
+          DELETE this file after saving passwords in your password manager.
+
+          Verify:
+            kubectl get pods -n garmin-ingest
+            kubectl get ingress -n garmin-ingest

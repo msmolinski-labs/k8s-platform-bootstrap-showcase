@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: garmin-ingest
+  labels:
+    app.kubernetes.io/name: garmin-ingest
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    app.kubernetes.io/name: garmin-ingest
+    app.kubernetes.io/component: api
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http

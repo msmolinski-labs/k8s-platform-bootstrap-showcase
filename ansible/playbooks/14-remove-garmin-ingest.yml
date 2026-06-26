@@ -1,0 +1,210 @@
+---
+
+- name: "[APP] Remove garmin-ingest application"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    secrets_file: "{{ repo_root }}/ansible/inventory/{{ env_name }}/group_vars/all/secrets.sops.yaml"
+    sops_helper: "{{ repo_root }}/scripts/sops_secrets.py"
+    sops_age_recipients: "{{ lookup('env', 'BOOTSTRAP_SOPS_AGE_RECIPIENTS') | default(lookup('env', 'SOPS_AGE_RECIPIENTS'), true) }}"
+    expected_git_branch: "{{ 'main' if env_name == 'prod' else env_name }}"
+    clean_vault: false
+    clean_secrets: "{{ (clean_sops | default(false)) or (clean_vault | default(false)) }}"
+
+  vars_prompt:
+    - name: confirm_remove
+      prompt: "This will DELETE garmin-ingest from {{ env_name }}. Type 'yes' to confirm"
+      private: false
+
+  tasks:
+
+    - name: "[PRE-CHECK] Require confirmation"
+      fail:
+        msg: "Aborted. You must type 'yes' to confirm removal."
+      when: confirm_remove != 'yes'
+
+    - name: "[PRE-CHECK] Require env_name parameter"
+      fail:
+        msg: |
+          Missing required parameter: env_name
+          Usage: ansible-playbook 14-remove-garmin-ingest.yml -e env_name=dev
+      when: env_name is not defined
+
+    - name: "[PRE-CHECK] Require supported environment name"
+      fail:
+        msg: |
+          Unsupported environment: {{ env_name }}
+          Expected: dev or prod
+      when: env_name not in ['dev', 'prod']
+
+    - name: "[PRE-CHECK] Get current git branch"
+      command: git -C "{{ repo_root }}" rev-parse --abbrev-ref HEAD
+      register: current_branch
+      changed_when: false
+
+    - name: "[PRE-CHECK] Fail on git branch mismatch"
+      fail:
+        msg: |
+          Git branch mismatch.
+          Environment: {{ env_name }}
+          Current branch: {{ current_branch.stdout }}
+          Expected branch: {{ expected_git_branch }}
+      when: current_branch.stdout != expected_git_branch
+
+    - name: "[PRE-CHECK] Get current kubectl context"
+      command: kubectl config current-context
+      register: current_context
+      changed_when: false
+
+    - name: "[PRE-CHECK] Fail on kubectl context mismatch"
+      fail:
+        msg: |
+          kubectl context does not match environment.
+          Environment: {{ env_name }}
+          Current context: {{ current_context.stdout }}
+          Expected context: {{ env_name }}
+
+          Switch with: kubectl config use-context {{ env_name }}
+      when: current_context.stdout != env_name
+
+    - name: "[PRE-CHECK] Verify git push access for secrets cleanup (dry-run)"
+      command: git -C "{{ repo_root }}" push --dry-run origin HEAD
+      register: git_remote_check
+      changed_when: false
+      failed_when: false
+      when: clean_secrets | bool
+
+    - name: "[PRE-CHECK] Fail if cannot push cleaned secrets to git remote"
+      fail:
+        msg: |
+          Cannot push to git remote. Secrets cleanup cannot be persisted.
+          Fix git authentication before running this playbook with clean_sops=true.
+      when:
+        - clean_secrets | bool
+        - git_remote_check.rc != 0
+
+    - name: "[CHECK] Verify garmin-ingest ArgoCD Application exists"
+      command: kubectl get application garmin-ingest -n argocd -o name
+      register: app_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SKIP] Application not found"
+      debug:
+        msg: "garmin-ingest ArgoCD Application does not exist on {{ env_name }}. Nothing to remove."
+      when: app_check.rc != 0
+
+    - name: "[DELETE] Remove garmin-ingest ArgoCD Application"
+      command: kubectl delete application garmin-ingest -n argocd
+      when: app_check.rc == 0
+      changed_when: true
+
+    - name: "[WAIT] Wait for ArgoCD cascade to delete namespace (2 min)"
+      command: kubectl get namespace garmin-ingest -o name
+      register: ns_after_cascade
+      retries: 12
+      delay: 10
+      until: ns_after_cascade.rc != 0
+      failed_when: false
+      changed_when: false
+      when: app_check.rc == 0
+
+    - name: "[DELETE] Namespace still exists – delete explicitly"
+      command: kubectl delete namespace garmin-ingest --timeout=180s
+      when: app_check.rc == 0 and ns_after_cascade.rc == 0
+      changed_when: true
+
+    - name: "[WAIT] Wait for namespace to be fully removed (3 min)"
+      command: kubectl get namespace garmin-ingest -o name
+      register: ns_final_check
+      retries: 18
+      delay: 10
+      until: ns_final_check.rc != 0
+      failed_when: false
+      changed_when: false
+      when: app_check.rc == 0 and (ns_after_cascade.rc | default(1)) == 0
+
+    - name: "[VERIFY] Final namespace check"
+      command: kubectl get namespace garmin-ingest -o name
+      register: ns_verify
+      changed_when: false
+      failed_when: false
+      when: app_check.rc == 0
+
+    - name: "[OK] garmin-ingest removed from cluster"
+      debug:
+        msg: "ArgoCD Application deleted. Namespace garmin-ingest cleaned up."
+      when: app_check.rc == 0 and ns_verify.rc != 0
+
+    - name: "[FAIL] Namespace garmin-ingest still exists"
+      fail:
+        msg: |
+          Namespace garmin-ingest was not removed after waiting.
+          Manual investigation required:
+            kubectl get ns garmin-ingest
+            kubectl get all -n garmin-ingest
+      when: app_check.rc == 0 and ns_verify.rc == 0
+
+
+    - name: "[SECRETS] Clean garmin credentials from secrets.sops.yaml"
+      when: clean_secrets | bool
+      block:
+        - name: "[SECRETS] Verify secrets.sops.yaml exists"
+          stat:
+            path: "{{ secrets_file }}"
+          register: secrets_stat
+
+        - name: "[SECRETS] Fail if secrets.sops.yaml missing"
+          fail:
+            msg: "Cannot clean garmin credentials because {{ secrets_file }} does not exist."
+          when: not secrets_stat.stat.exists
+
+        - name: "[SECRETS] Remove garmin credentials keys"
+          command: >
+            python3 {{ sops_helper }} delete --file {{ secrets_file }}
+            --age-recipients {{ sops_age_recipients | quote }}
+            --key vault_garmin_db_user
+            --key vault_garmin_db_password
+            --key vault_garmin_auth_username
+            --key vault_garmin_auth_password
+          changed_when: true
+          no_log: true
+
+        - name: "[OK] Garmin credentials removed from secrets.sops.yaml"
+          debug:
+            msg: "vault_garmin_* variables removed from {{ secrets_file }}"
+
+        - name: "[GIT] Stage cleaned secrets.sops.yaml"
+          command: git -C "{{ repo_root }}" add "{{ secrets_file }}"
+          changed_when: true
+
+        - name: "[GIT] Check if cleaned secrets need commit"
+          command: git -C "{{ repo_root }}" status --porcelain "{{ secrets_file }}"
+          register: git_clean_status
+          changed_when: false
+
+        - name: "[GIT] Commit cleaned garmin secrets"
+          command: >
+            git -C "{{ repo_root }}"
+            commit -m "chore(secrets): remove garmin-ingest credentials for {{ env_name }} [teardown]"
+          when: git_clean_status.stdout != ""
+          changed_when: true
+
+        - name: "[GIT] Push cleaned garmin secrets"
+          command: git -C "{{ repo_root }}" push origin {{ current_branch.stdout }}
+          when: git_clean_status.stdout != ""
+          changed_when: true
+
+    - name: "[DONE] Removal complete"
+      debug:
+        msg: |
+          garmin-ingest removed from {{ env_name }}.
+
+          {{ 'Stored credentials cleaned from secrets.sops.yaml and pushed to git.' if (clean_secrets | bool) else 'Stored credentials preserved (re-deploy will reuse them).' }}
+
+          Note: Sealed secret YAMLs and manifests remain in git.
+          They are harmless without the ArgoCD Application.
+          To fully clean git, remove kubernetes/apps/garmin-ingest/ and commit.

@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garmin-ingest-ingress
+  namespace: garmin-ingest
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+spec:
+  tls:
+    - hosts:
+        - garmin.dev-klexify.cloud
+      secretName: garmin-ingest-tls
+  rules:
+    - host: garmin.dev-klexify.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80

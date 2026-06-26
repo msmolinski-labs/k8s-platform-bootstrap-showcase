@@ -1,0 +1,36 @@
+---
+
+base_domain: "dev-klexify.cloud"
+acme_email: "smolak@gmail.com"
+
+lb_ip: "87.106.21.4"
+nginx_upstream_port: "30080"
+nginx_upstream_port_ssl: "30443"
+
+pod_network_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+
+minio_port: "9000"
+minio_loki_user: "loki"
+minio_loki_bucket: "loki-dev"
+minio_storage_endpoint: "http://{{ hostvars[groups['storage_nodes'][0]]['ansible_host'] }}:{{ minio_port }}"
+
+kubernetes_version: "1.31"
+cilium_version: "1.16.6"
+argocd_chart_version: "9.4.4"
+argocd_namespace: "argocd"
+
+kubeconfig_local: "~/.kube/config"
+kubeconfig_remote: "/etc/kubernetes/admin.conf"
+bootstrap_manifests_path: "/tmp/k8s-cluster-bootstrap/bootstrap/{{ env_name }}"
+
+github_org: "msmolinski-labs"
+github_repo: "k8s-cluster-bootstrap"
+github_token: "{{ vault_github_token | default('', true) }}"
+
+minio_root_user: "{{ vault_minio_root_user | default('', true) }}"
+minio_root_password: "{{ vault_minio_root_password | default('', true) }}"
+minio_loki_secret_key: "{{ vault_minio_loki_secret_key | default('', true) }}"
+grafana_admin_user: "{{ vault_grafana_admin_user | default('', true) }}"
+grafana_admin_password: "{{ vault_grafana_admin_password | default('', true) }}"
+alertmanager_slack_webhook: "{{ vault_alertmanager_slack_webhook | default('', true) }}"

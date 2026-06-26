@@ -1,0 +1,136 @@
+---
+- name: "[JOIN] Join worker nodes to cluster"
+  hosts: workers
+  become: true
+  serial: 1
+
+  tasks:
+
+    - name: "[PRE-CHECK] Check if worker already joined the cluster"
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_joined
+
+    - name: "[PRE-CHECK] Check for stale kubeadm PKI on worker"
+      stat:
+        path: /etc/kubernetes/pki/ca.crt
+      register: worker_pki_ca
+
+    - name: "[PRE-CHECK] Check for stale kubelet config on worker"
+      stat:
+        path: /var/lib/kubelet/config.yaml
+      register: worker_kubelet_config
+
+    - name: "[PRE-CHECK] Check for stale CNI config on worker"
+      stat:
+        path: /etc/cni/net.d
+      register: worker_cni_dir
+
+    - name: "[PRE-CHECK] Mark stale partial join state"
+      set_fact:
+        worker_has_partial_join_state: "{{ worker_pki_ca.stat.exists or worker_kubelet_config.stat.exists or worker_cni_dir.stat.exists }}"
+
+    - name: "[INFO] Worker already joined – skipping"
+      debug:
+        msg: "File /etc/kubernetes/kubelet.conf exists. Node {{ inventory_hostname }} is already part of the cluster."
+      when: worker_joined.stat.exists
+
+    - name: "[RESET] Clean stale partial kubeadm worker state before retry"
+      block:
+        - name: "[RESET] Run kubeadm reset on worker"
+          command: kubeadm reset -f
+          register: kubeadm_reset
+          changed_when: true
+          failed_when: false
+
+        - name: "[RESET] Remove stale Kubernetes worker state directories"
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/kubernetes/pki
+            - /etc/kubernetes/manifests
+            - /etc/cni/net.d
+            - /var/lib/kubelet
+
+        - name: "[RESET] Remove stale Kubernetes worker state files"
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/kubernetes/bootstrap-kubelet.conf
+            - /etc/kubernetes/kubelet.conf
+            - /etc/kubernetes/admin.conf
+            - /etc/kubernetes/super-admin.conf
+
+        - name: "[RESET] Recreate empty kubelet workdir"
+          file:
+            path: /var/lib/kubelet
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: "[INFO] Partial worker join state cleaned"
+          debug:
+            msg: "Detected stale kubeadm artifacts on {{ inventory_hostname }} and cleaned them before retrying join."
+      when:
+        - not worker_joined.stat.exists
+        - worker_has_partial_join_state
+
+    - name: "[JOIN] Join worker node to cluster"
+      block:
+
+        - name: "[JOIN] Fetch join command from control-plane"
+          slurp:
+            src: /tmp/kubeadm_join_command
+          delegate_to: "{{ groups['control_plane'][0] }}"
+          register: join_command_b64
+
+        - name: "[JOIN] Decode join command"
+          set_fact:
+            join_command: "{{ join_command_b64.content | b64decode | trim }}"
+
+        - name: "[PRE-CHECK] Wait for control-plane API from worker"
+          command: >
+            curl -sk --max-time 5
+            https://{{ hostvars[groups['control_plane'][0]].ansible_host }}:6443/readyz
+          register: api_ready_from_worker
+          changed_when: false
+          retries: 12
+          delay: 5
+          until: api_ready_from_worker.stdout is search('ok')
+
+        - name: "[JOIN] Run kubeadm join"
+          command: "{{ join_command }}"
+          register: join_output
+
+        - name: "[JOIN] Print join output"
+          debug:
+            msg: "{{ join_output.stdout_lines }}"
+
+        - name: "[OK] Worker joined the cluster"
+          debug:
+            msg: "{{ inventory_hostname }} successfully joined the cluster."
+
+      rescue:
+        - name: "[ERROR] kubeadm join failed"
+          debug:
+            msg: |
+              kubeadm join failed on {{ inventory_hostname }}.
+
+              Troubleshooting:
+                1. Is control-plane healthy?     →  kubectl get nodes
+                2. Has the token expired?        →  kubeadm token list  (on control-plane)
+                3. Is port 6443 reachable?
+                4. kubelet logs on this worker:  →  journalctl -xeu kubelet --no-pager | tail -30
+
+              To retry:
+                kubeadm reset -f
+                Regenerate token on control-plane: kubeadm token create --print-join-command
+
+        - name: "[FAIL] Stop after kubeadm join failure"
+          fail:
+            msg: "kubeadm join failed on {{ inventory_hostname }}."
+
+      when: not worker_joined.stat.exists

@@ -1,0 +1,127 @@
+---
+
+- name: "[GITOPS] Bootstrap system-app"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: "[PRE-CHECK] Check if ArgoCD is available"
+      command: kubectl get deployment argocd-server -n {{ argocd_namespace }}
+      register: argocd_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[GUARD] Fail if ArgoCD not installed"
+      fail:
+        msg: |
+          ArgoCD not found in namespace {{ argocd_namespace }}.
+          Run playbook 08-install-argocd.yml first.
+      when: argocd_check.rc != 0
+
+    - name: "[PRE-CHECK] Wait for ArgoCD server to be ready"
+      command: >
+        kubectl rollout status deployment/argocd-server
+        -n {{ argocd_namespace }} --timeout=120s
+
+    - name: "[PRE-CHECK] Confirm repo Secret exists before triggering sync"
+      command: kubectl get secret github-repo-creds -n {{ argocd_namespace }}
+      register: repo_secret_check
+      retries: 12
+      delay: 5
+      until: repo_secret_check.rc == 0
+
+    - name: "[STEP] Generate system-app.yaml for this environment"
+      block:
+
+        - name: "[STEP] Set git branch per environment"
+          set_fact:
+            git_branch: "{{ 'main' if env_name == 'prod' else env_name }}"
+
+        - name: "[STEP] Ensure local bootstrap manifest temp directory exists"
+          file:
+            path: "{{ bootstrap_manifests_path }}"
+            state: directory
+            mode: '0700'
+
+        - name: "[STEP] Generate system-app.yaml for {{ env_name }} (branch {{ git_branch }})"
+          copy:
+            dest: "{{ bootstrap_manifests_path }}/system-app.yaml"
+            content: |
+              apiVersion: argoproj.io/v1alpha1
+              kind: Application
+              metadata:
+                name: system
+                namespace: argocd
+              spec:
+                project: default
+                source:
+                  repoURL: https://github.com/{{ github_org }}/{{ github_repo }}.git
+                  targetRevision: {{ git_branch }}
+                  path: kubernetes/system
+                destination:
+                  server: https://kubernetes.default.svc
+                  namespace: argocd
+                syncPolicy:
+                  automated:
+                    prune: true
+                    selfHeal: true
+                  syncOptions:
+                    - CreateNamespace=true
+
+        - name: "[OK] system-app.yaml generated for {{ env_name }}"
+          debug:
+            msg: "targetRevision: {{ git_branch }}, path: kubernetes/system, local file: {{ bootstrap_manifests_path }}/system-app.yaml"
+
+    - name: "[STEP] Apply system-app.yaml"
+      block:
+
+        - name: "[STEP] Apply system-app.yaml"
+          command: kubectl apply -f {{ bootstrap_manifests_path }}/system-app.yaml
+          register: system_apply
+
+        - name: "[STEP] Print system-app apply result"
+          debug:
+            msg: "{{ system_apply.stdout_lines }}"
+
+        - name: "[WAIT] Wait for Sealed Secrets deployment to appear"
+          command: kubectl get deployment sealed-secrets -n kube-system
+          register: ss_check
+          retries: 60
+          delay: 10
+          until: ss_check.rc == 0
+
+        - name: "[WAIT] Wait for Sealed Secrets controller to be ready"
+          command: >
+            kubectl rollout status deployment/sealed-secrets
+            -n kube-system --timeout=180s
+
+        - name: "[STORAGE] Set local-path as default StorageClass"
+          shell: |
+            kubectl patch storageclass local-path \
+              -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+          register: sc_patch
+          retries: 18
+          delay: 10
+          until: sc_patch.rc == 0
+          failed_when: false
+          changed_when: sc_patch.rc == 0
+
+        - name: "[OK] system-app ready"
+          debug:
+            msg: |
+              system-app synced. Sealed Secrets controller is running.
+              StorageClass local-path set as default.
+              Next: Phase 10 will seal secrets, Phase 11 will apply monitoring.
+
+      rescue:
+        - name: "[ERROR] system-app failed"
+          debug:
+            msg: |
+              system-app.yaml failed or Sealed Secrets controller did not become ready.
+              Check: kubectl describe application system -n {{ argocd_namespace }}
+
+        - name: "[FAIL] Stop after system-app bootstrap failure"
+          fail:
+            msg: "system-app bootstrap failed."

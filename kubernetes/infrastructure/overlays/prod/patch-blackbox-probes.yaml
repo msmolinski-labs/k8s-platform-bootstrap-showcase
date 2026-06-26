@@ -1,0 +1,11 @@
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: http-endpoints
+  namespace: monitoring
+spec:
+  targets:
+    staticConfig:
+      static:
+        - https://argocd.klexify.io
+        - https://grafana.klexify.io
